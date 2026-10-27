@@ -828,7 +828,7 @@ function openGame() {
       <div class="btns">
         <button class="btn gold" id="bHint">Подсказка</button><button class="btn" id="bUndo">Отменить ход</button>
         <button class="btn" id="bFlip">Развернуть доску</button><button class="btn" id="bCopy">Копировать запись</button>
-        <button class="btn" id="bEv">Оценка лунок</button><button class="btn" id="bRestart">Начать заново</button><button class="btn warn" id="bMenu">В меню</button>
+        <button class="btn gold" id="bManual">Ходить за бота</button><button class="btn" id="bEv">Оценка лунок</button><button class="btn" id="bRestart">Начать заново</button><button class="btn warn" id="bMenu">В меню</button>
       </div>
       <div><div class="tabs" role="tablist"><button role="tab" id="tHist">Ходы</button><button role="tab" id="tHint">Подсказка</button><button role="tab" id="tAn">Разбор</button></div><div class="tabbox" id="tabbox"></div></div>
     </aside>
@@ -838,6 +838,12 @@ function openGame() {
   $('#bUndo').onclick = undo;
   $('#bFlip').onclick = () => { G.flip = 1 - G.flip; buildBoard(); renderAll(); };
   $('#bCopy').onclick = copyRecord;
+  $('#bManual').onclick = () => {
+    if (G.mode !== 'bot' || busy) return;
+    G.manual = !G.manual;
+    if (G.manual && thinking) { stopThinking(); thinking = false; }
+    renderAll(); botTurn(); autoEval();
+  };
   $('#bEv').onclick = () => { pref.holeEval = !pref.holeEval; store.set(K_PREF, pref); renderAll(); if (pref.holeEval) autoEval(); };
   $('#bRestart').onclick = () => { if (!G.log.length || confirm('Начать эту партию заново? Текущая будет потеряна.')) { dropSave(); const o = { mode: G.mode, level: G.level, human: G.human, start: G.start }; startGame(o); } };
   $('#tHist').onclick = () => { tab = 'hist'; renderAll(); };
@@ -851,7 +857,8 @@ function openGame() {
 }
 function leaveGame() { saveGame(); showHome(); }
 const cur = () => G.hist[G.hist.length - 1];
-const humanTurn = s => G.mode === 'friend' || s.turn === G.human;
+// G.manual: в игре с ботом человек ходит и за бота (кнопка «Ходить за бота» / «Вернуть бота»)
+const humanTurn = s => G.mode === 'friend' || G.manual || s.turn === G.human;
 function bottomSide() {
   if (G && G.mode === 'puzzle') { const p = pzCur(); return p ? p.turn : 0; }
   if (G && G.mode === 'setup') return 0;
@@ -1053,7 +1060,7 @@ async function doMove(rel) {
 function botTurn() {
   if (!G || G.mode !== 'bot') return;
   const s = cur();
-  if (!NET || s.over || s.turn === G.human || busy || an.status === 'run' || review) return;
+  if (!NET || s.over || s.turn === G.human || G.manual || busy || an.status === 'run' || review) return;
   thinking = true;
   renderAll();
   const t0 = Date.now(), ply = G.hist.length, lv = LEVELS[G.level], game = G;
@@ -1074,7 +1081,7 @@ function autoEval() {
   if (!G || (G.mode !== 'friend' && G.mode !== 'bot') || !NET || busy || review || an.status === 'run' || thinking) return;
   const s = cur(), ply = G.hist.length, game = G;
   if (s.over) { chance = { white: s.winner === 0 ? 1 : s.winner === 1 ? 0 : 0.5 }; return renderPanel(); }
-  if (G.mode === 'bot' && s.turn !== G.human) return;
+  if (G.mode === 'bot' && s.turn !== G.human && !G.manual) return;
   if (pref.holeEval) {
     evalMovesInWorker(s, EV_SIMS).then(list => {
       if (G !== game || G.hist.length !== ply || cur() !== s || busy || thinking) return;
@@ -1110,7 +1117,7 @@ function undo() {
   if (busy || G.hist.length < 2 || an.status === 'run') return;
   review = null; stopThinking(); thinking = false;
   G.hist.pop(); G.log.pop();
-  if (G.mode === 'bot') while (G.hist.length > 1 && cur().turn !== G.human) { G.hist.pop(); G.log.pop(); }
+  if (G.mode === 'bot' && !G.manual) while (G.hist.length > 1 && cur().turn !== G.human) { G.hist.pop(); G.log.pop(); }
   analysis = null; chance = null;
   saveGame(); renderAll(); botTurn(); autoEval();
 }
@@ -1276,7 +1283,8 @@ function renderPanel() {
     else if (G.mode === 'bot') { const w = s.winner === G.human; main = (w ? 'Вы победили · ' : 'Победил бот · ') + sc; cls = w ? 'win' : 'lose'; }
     else main = `Победили ${SIDE[s.winner]} · ${sc}`;
     sub = 'Партия окончена. Можно разобрать её во вкладке «Разбор».';
-  } else if (G.mode === 'bot') main = thinking ? (s.turn === G.human ? 'Анализирую…' : 'Бот думает…') : (s.turn === G.human ? 'Ваш ход' : 'Ход бота');
+  } else if (G.mode === 'bot' && G.manual) main = thinking ? 'Анализирую…' : `Вы ходите за обоих · ход: ${SIDE[s.turn]}`;
+  else if (G.mode === 'bot') main = thinking ? (s.turn === G.human ? 'Анализирую…' : 'Бот думает…') : (s.turn === G.human ? 'Ваш ход' : 'Ход бота');
   else main = thinking ? 'Бот считает подсказку…' : `Ход: ${SIDE[s.turn]}`;
   if (!s.over) sub = li ? `Последний ход (${SIDE[li.player]}): ${notation(li)}` : (G.start ? 'Своя позиция.' : 'Белые начинают.');
   const st = $('#status');
@@ -1305,6 +1313,9 @@ function renderPanel() {
   $('#bFlip').style.display = G.mode === 'bot' ? 'none' : '';
   $('#bEv').textContent = 'Оценка лунок: ' + (pref.holeEval ? 'вкл' : 'выкл');
   $('#bEv').disabled = !NET;
+  $('#bManual').style.display = G.mode === 'bot' ? '' : 'none';
+  $('#bManual').textContent = G.manual ? 'Вернуть бота' : 'Ходить за бота';
+  $('#bManual').disabled = busy || s.over;
   for (const [id, t] of [['tHist', 'hist'], ['tHint', 'hint'], ['tAn', 'an']]) $('#' + id).setAttribute('aria-selected', tab === t);
   const box = $('#tabbox');
   if (tab === 'an') return renderAnalysisTab(box);
