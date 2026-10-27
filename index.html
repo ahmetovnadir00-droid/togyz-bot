@@ -343,6 +343,11 @@ dialog h4 { font-family: var(--serif); font-style: italic; font-size: 15px; }
   .card .pill { top: 8px; right: 10px; font-size: 12px; }
   .home .foot { margin-top: 14px; font-size: 12px; }
 }
+.evbar .dp { left: 50%; transform: translate(-50%, -50%); font: italic 11px/1 var(--serif); color: #fff; text-shadow: 0 0 3px #000, 0 0 2px #000; }
+.evbar.live { box-shadow: inset 0 2px 4px rgba(0,0,0,.6), 0 0 0 2px rgba(242,201,76,.45); animation: evpulse 1.2s ease-in-out infinite; }
+@keyframes evpulse { 50% { box-shadow: inset 0 2px 4px rgba(0,0,0,.6), 0 0 0 2px rgba(242,201,76,.95); } }
+.lab .sc { transition: background-color .4s; }
+@media (prefers-reduced-motion: reduce) { .evbar.live { animation: none; } }
 
 </style>
 </head>
@@ -544,7 +549,8 @@ function engineLib() {
     return null;
   }
   function think(s, o) {
-    let root = o.reuse && cacheRoot ? findNode(cacheRoot, s, 3) : null;
+    // o.root — продолжить поиск в уже начатом дереве (для живой оценки, которая углубляется по шагам)
+    let root = o.root || (o.reuse && cacheRoot ? findNode(cacheRoot, s, 3) : null);
     if (!root) root = { s, P: null, N: new Float32Array(9), W: new Float32Array(9), kids: [] };
     const re = evalNet(s);
     if (!root.P) root.P = re.P;
@@ -618,6 +624,26 @@ function engineLib() {
     return out;
   }
 
+  // ---- живая оценка: то же, что evalMoves, но поиск после каждого хода углубляется шагами steps,
+  // а после каждого шага cb(список, номер шага, всего шагов) — чтобы цифры и шкала обновлялись на глазах ----
+  function evalMovesLive(s, steps, cb) {
+    const kids = [];
+    for (let a = 0; a < 9; a++) {
+      if (s.b[s.turn * 9 + a] === 0) continue;
+      const c = play(s, a, false).s;
+      kids.push({ move: a, s: c, root: c.over ? null : { s: c, P: null, N: new Float32Array(9), W: new Float32Array(9), kids: [] } });
+    }
+    let list = [];
+    for (let k = 0; k < steps.length; k++) {
+      list = kids.map(kd => {
+        const v = kd.root ? -think(kd.s, { sims: steps[k], root: kd.root }).rootV : -terminal(kd.s);
+        return { move: kd.move, win: (1 + v) / 2 };
+      });
+      if (cb) cb(list, k + 1, steps.length);
+    }
+    return list;
+  }
+
   // ---- разбор партии: оценка каждой позиции поиском ----
   function analyzeGame(moves, sims, onProgress, start) {
     const states = [start ? JSON.parse(JSON.stringify(start)) : initial()], infos = [];
@@ -645,7 +671,7 @@ function engineLib() {
     });
     return { res, whiteWin: ev.map((e, k) => states[k].turn === 0 ? (1 + e.v) / 2 : (1 - e.v) / 2) };
   }
-  return { initial, play, loadNet, think, evalMoves, analyzeGame, finish, sideStones };
+  return { initial, play, loadNet, think, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
 }
 
 
@@ -689,6 +715,11 @@ if (NET) {
         const d = e.data;
         if (d.net) { W.loadNet(d.net); return; }
         if (d.evalMoves) { postMessage({ id: d.id, r: W.evalMoves(d.evalMoves, d.sims) }); return; }
+        if (d.evalLive) {
+          const r = W.evalMovesLive(d.evalLive, d.steps, (l, k, n) => postMessage({ id: d.id, progress: [l, k, n] }));
+          postMessage({ id: d.id, r });
+          return;
+        }
         if (d.analyze) {
           const r = W.analyzeGame(d.analyze, d.sims, (a, b) => postMessage({ id: d.id, progress: [a, b] }), d.start);
           postMessage({ id: d.id, r });
@@ -726,6 +757,9 @@ function ask(msg, local, onProgress) {
 }
 const think = (state, opts) => ask({ state, opts }, () => E.think(state, opts));
 const evalMovesInWorker = (state, sims) => ask({ evalMoves: state, sims }, () => E.evalMoves(state, sims));
+// без Web Worker живая оценка делает только первый, быстрый шаг (иначе страница замрёт)
+const evalLiveInWorker = (state, steps, onProgress) =>
+  ask({ evalLive: state, steps }, () => E.evalMovesLive ? E.evalMovesLive(state, steps.slice(0, 1), onProgress) : E.evalMoves(state, 250), onProgress);
 const analyzeInWorker = (moves, sims, start, onProgress) =>
   ask({ analyze: moves, sims, start }, () => E.analyzeGame(moves, sims, onProgress, start), onProgress);
 
@@ -820,7 +854,7 @@ function openGame() {
   <div class="top"><button class="back" id="bk">← Меню</button><span class="ttl">Тоғызқұмалақ</span><span class="chip">${chip}</span><span class="sp"></span><small>${NET ? 'сеть: ' + (NET.label || 'поколение ' + NET.gen) : ''}</small></div>
   <div class="band"></div>
   <div class="gwrap">
-    <section class="stage"><div class="pl" id="plTop"></div><div class="frame"><div class="evbar" id="evBar" title="оценка позиции ботом"><i id="evW"></i><span class="l" id="evWt"></span><span class="r" id="evBt"></span></div><div class="board" id="board"></div></div><div class="pl" id="plBot"></div>
+    <section class="stage"><div class="pl" id="plTop"></div><div class="frame"><div class="evbar" id="evBar" title="оценка позиции ботом"><i id="evW"></i><span class="l" id="evWt"></span><span class="dp" id="evDp"></span><span class="r" id="evBt"></span></div><div class="board" id="board"></div></div><div class="pl" id="plBot"></div>
       <div class="hint">Числа у номеров лунок — шанс победы (из 100), если сходить из этой лунки; золотом — лучший ход. Ход — клик по лунке или клавиши 1–9.</div></section>
     <aside class="side">
       <div class="panel status" id="status" aria-live="polite"></div>
@@ -1076,20 +1110,22 @@ function botTurn() {
 // Оценка лунок: после каждого хода бот коротко просчитывает каждый возможный ход и пишет на лунке
 // шанс победы (0–100) того, кто ходит. В игре с ботом — только когда ходите вы.
 let holeEval = null;
-const EV_SIMS = 250;
+const EV_STEPS = [60, 140, 300, 600, 1200]; // симуляций на каждый ход за шаг; всего ~2300 на ход (~20 с на компьютере)
 function autoEval() {
   if (!G || (G.mode !== 'friend' && G.mode !== 'bot') || !NET || busy || review || an.status === 'run' || thinking) return;
   const s = cur(), ply = G.hist.length, game = G;
   if (s.over) { chance = { white: s.winner === 0 ? 1 : s.winner === 1 ? 0 : 0.5 }; return renderPanel(); }
   if (G.mode === 'bot' && s.turn !== G.human && !G.manual) return;
   if (pref.holeEval) {
-    evalMovesInWorker(s, EV_SIMS).then(list => {
-      if (G !== game || G.hist.length !== ply || cur() !== s || busy || thinking) return;
+    // живая оценка: цифры и шкала уточняются по мере того, как поиск углубляется
+    const apply = (list, k, n) => {
+      if (G !== game || G.hist.length !== ply || cur() !== s || busy || thinking || !list.length) return;
       const best = Math.max(...list.map(m => m.win));
-      holeEval = { s, list, best };
+      holeEval = { s, list, best, k, n };
       chance = { white: s.turn === 0 ? best : 1 - best };
       renderAll();
-    });
+    };
+    evalLiveInWorker(s, EV_STEPS, apply).then(list => apply(list, EV_STEPS.length, EV_STEPS.length));
     return;
   }
   if (G.mode !== 'friend') return;
@@ -1313,6 +1349,9 @@ function renderPanel() {
   $('#bFlip').style.display = G.mode === 'bot' ? 'none' : '';
   $('#bEv').textContent = 'Оценка лунок: ' + (pref.holeEval ? 'вкл' : 'выкл');
   $('#bEv').disabled = !NET;
+  const live = holeEval && holeEval.s === s && holeEval.k < holeEval.n;
+  $('#evBar').classList.toggle('live', !!live);
+  $('#evDp').textContent = live ? `глубина ${holeEval.k}/${holeEval.n}` : '';
   $('#bManual').style.display = G.mode === 'bot' ? '' : 'none';
   $('#bManual').textContent = G.manual ? 'Вернуть бота' : 'Ходить за бота';
   $('#bManual').disabled = busy || s.over;
