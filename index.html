@@ -598,6 +598,84 @@ function engineLib() {
     }
     return null;
   }
+  // Параллельный поиск: дерево ведёт этот поток, сеть считают несколько воркеров (evals[i](states) → Promise<[{P, v}]>).
+  // Каждый воркер получает свою пачку листьев; «виртуальная потеря» не даёт пачке сойтись в одну ветку.
+  async function thinkAsync(s, o, evals, batch) {
+    let root = o.reuse && cacheRoot ? findNode(cacheRoot, s, 3) : null;
+    if (!root) root = { s, P: null, N: new Float32Array(9), W: new Float32Array(9), kids: [] };
+    if (!root.P) { const [e] = await evals[0]([s]); root.P = Float32Array.from(e.P); }
+    if (o.reuse) cacheRoot = root;
+    const sims = o.sims, cpuct = o.cpuct || (sims <= 300 ? 1.0 : 1.25), tStart = Date.now();
+    const k = batch || 8;
+    let done = 0, started = 0, stop = false;
+    const back = (path, v) => {
+      for (let j = path.length - 2; j >= 0; j -= 2) {
+        v = -v;
+        path[j].N[path[j + 1]] += 1;
+        path[j].W[path[j + 1]] += v;
+      }
+    };
+    const virt = (path, sign) => {
+      for (let j = path.length - 2; j >= 0; j -= 2) { path[j].N[path[j + 1]] += sign; path[j].W[path[j + 1]] -= sign; }
+    };
+    function select() {
+      let node = root;
+      const path = [];
+      for (;;) {
+        if (node.s.over) { back(path, terminal(node.s)); done++; started++; return null; }
+        if (!node.P) {
+          if (node.wait) return null; // этот лист уже считается другим воркером
+          node.wait = true;
+          virt(path, 1);
+          return { node, path };
+        }
+        const p = node.s.turn;
+        let ntot = 0;
+        for (let a = 0; a < 9; a++) ntot += node.N[a];
+        const sq = Math.sqrt(ntot + 1);
+        let best = -1e9, ba = -1;
+        for (let a = 0; a < 9; a++) {
+          if (node.s.b[p * 9 + a] === 0) continue;
+          const n = node.N[a];
+          const u = (n > 0 ? node.W[a] / n : 0) + cpuct * node.P[a] * sq / (1 + n);
+          if (u > best) { best = u; ba = a; }
+        }
+        path.push(node, ba);
+        if (!node.kids[ba]) node.kids[ba] = { s: play(node.s, ba, false).s, P: null, N: new Float32Array(9), W: new Float32Array(9), kids: [] };
+        node = node.kids[ba];
+      }
+    }
+    async function loop(ev) {
+      while (!stop) {
+        if (started >= sims || (o.ms && Date.now() - tStart > o.ms) || (o.cancel && o.cancel())) { stop = true; break; }
+        const leaves = [];
+        for (let tries = 0; leaves.length < k && tries < 2 * k && started < sims; tries++) {
+          const l = select();
+          if (l) { leaves.push(l); started++; } else if (started >= sims) break;
+        }
+        if (!leaves.length) { await new Promise(r => setTimeout(r, 1)); continue; } // все листья заняты: ждём ответов
+        const res = await ev(leaves.map(l => l.node.s));
+        for (let i = 0; i < leaves.length; i++) {
+          const { node, path } = leaves[i];
+          node.P = Float32Array.from(res[i].P); node.wait = false;
+          virt(path, -1);
+          back(path, res[i].v);
+          done++;
+        }
+      }
+    }
+    await Promise.all(evals.map(loop));
+    const moves = [];
+    let tot = 0;
+    for (let a = 0; a < 9; a++) tot += root.N[a];
+    for (let a = 0; a < 9; a++) {
+      if (s.b[s.turn * 9 + a] === 0) continue;
+      const n = root.N[a];
+      moves.push({ move: a, share: tot ? n / tot : 0, q: n ? root.W[a] / n : null, prior: root.P[a] });
+    }
+    moves.sort((x, y) => y.share - x.share);
+    return { best: moves[0].move, moves, rootV: moves[0].q, sims: done };
+  }
   function think(s, o) {
     // o.root — продолжить поиск в уже начатом дереве (для живой оценки, которая углубляется по шагам)
     let root = o.root || (o.reuse && cacheRoot ? findNode(cacheRoot, s, 3) : null);
@@ -721,7 +799,7 @@ function engineLib() {
     });
     return { res, whiteWin: ev.map((e, k) => states[k].turn === 0 ? (1 + e.v) / 2 : (1 - e.v) / 2) };
   }
-  return { initial, play, loadNet, think, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
+  return { initial, play, loadNet, evalNet, think, thinkAsync, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
 }
 
 
@@ -741,8 +819,8 @@ const LEVELS = [
   { name: 'Любитель', sims: 60, info: '60 вариантов, мгновенно' },
   { name: 'Сильный', sims: 400, info: '400 вариантов на ход' },
   { name: 'Мастер', sims: 3000, info: '3 000 вариантов, ~1 с' },
-  { name: 'Максимум', sims: 60000, ms: 5000, info: 'до 5 секунд на ход' },
-  { name: 'Предел', sims: 32000, ms: 15000, info: '32 000 вариантов, ~10 с' },
+  { name: 'Максимум', sims: 200000, ms: 5000, info: 'до 5 секунд на ход' },
+  { name: 'Предел', sims: 400000, ms: 15000, info: 'до 15 секунд на ход' },
 ];
 const AN_SIMS = 300;
 const K_SAVES = 'togyz-app-saves-v1', K_PZ = 'togyz-pz-v1', K_PREF = 'togyz-app-pref-v1';
@@ -764,6 +842,7 @@ if (NET) {
       onmessage = e => {
         const d = e.data;
         if (d.net) { W.loadNet(d.net); return; }
+        if (d.batch) { postMessage({ id: d.id, r: d.batch.map(s => { const e = W.evalNet(s); return { P: Array.from(e.P), v: e.v }; }) }); return; }
         if (d.evalMoves) { postMessage({ id: d.id, r: W.evalMoves(d.evalMoves, d.sims) }); return; }
         if (d.evalLive) {
           const r = W.evalMovesLive(d.evalLive, d.steps, (l, k, n) => postMessage({ id: d.id, progress: [l, k, n] }));
@@ -805,7 +884,34 @@ function ask(msg, local, onProgress) {
     } catch (e) { worker = null; workerBusy = false; fallback(); }
   });
 }
-const think = (state, opts) => ask({ state, opts }, () => E.think(state, opts));
+/* Пул воркеров для параллельного поиска: у каждого своя копия сети, дерево ведёт главный поток (E.thinkAsync). */
+const NPOOL = workerURL ? Math.min(8, (navigator.hardwareConcurrency || 1) - 1) : 0;
+let pool = null;
+function getPool() {
+  if (NPOOL < 2) return null;
+  if (pool) return pool;
+  try {
+    pool = [];
+    for (let i = 0; i < NPOOL; i++) {
+      const w = new Worker(workerURL), waits = new Map();
+      let n = 0;
+      w.postMessage({ net: NET });
+      w.onmessage = e => { const f = waits.get(e.data.id); if (f) { waits.delete(e.data.id); f[0](e.data.r); } };
+      // воркер упал — досчитываем его пачки здесь, чтобы поиск не завис
+      w.onerror = () => { for (const [res, st] of waits.values()) res(st.map(s => E.evalNet(s))); waits.clear(); };
+      pool.push(states => new Promise(res => { const id = ++n; waits.set(id, [res, states]); w.postMessage({ id, batch: states }); }));
+    }
+  } catch (e) { pool = null; }
+  return pool;
+}
+function think(state, opts) {
+  const P = opts.sims >= 1000 && getPool();
+  if (!P) return ask({ state, opts }, () => E.think(state, opts));
+  stopThinking();
+  const id = reqId;
+  return E.thinkAsync(state, Object.assign({ cancel: () => id !== reqId }, opts), P, opts.sims < 5000 ? 4 : 8)
+    .then(r => new Promise(res => { if (id === reqId) res(r); }));
+}
 const evalMovesInWorker = (state, sims) => ask({ evalMoves: state, sims }, () => E.evalMoves(state, sims));
 // без Web Worker живая оценка делает только первый, быстрый шаг (иначе страница замрёт)
 const evalLiveInWorker = (state, steps, onProgress) =>
