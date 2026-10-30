@@ -408,6 +408,31 @@ function engineLib() {
     l0.WT = WT;
     net = { L, pol: { in: j.pol.in, out: 9, W: f32(j.pol.w), b: f32(j.pol.b) }, val: { in: j.val.in, out: 1, W: f32(j.val.w), b: f32(j.val.b) } };
     bufs = { x: new Float32Array(Math.max(617, L[0].in)), scratch: new Int32Array(18), h: L.map(l => new Float32Array(l.out)), lg: new Float32Array(9) };
+    wasm = setupWasm();
+    if (wasm) { bufs.x = wasm.view(wasm.off.x, L[0].in); bufs.lg = wasm.view(wasm.off.lg, 9); }
+  }
+  // Слои сети на WebAssembly SIMD (модуль собран f4/build_wasm.py): в ~5 раз быстрее JS; без поддержки — JS-вариант в evalNet
+  const WASM_NET = 'AGFzbQEAAAABFAJgBn9/f39/fwBgB39/f39/f38AAggBAWUBbQIAAQMEAwABAQcbAwZzcGFyc2UAAAVkZW5zZQABBmRlbnNlNAACCtkHA+oBAwV/AX0BeyAEQQJ0IQkgA0ECdCEKQQAhBwNAIAUgB2ogASAHav0AAAD9CwAAIAdBEGohByAHIAlJDQALQQAhBiAAIQgDQCACIAZqKgIAIgtDAAAAAFwEQCAL/RMhDEEAIQcDQCAFIAdqIAUgB2r9AAAAIAggB2r9AAAAIAz95gH95AH9CwAAIAdBEGohByAHIAlJDQALCyAIIAlqIQggBkEEaiEGIAYgCkkNAAtBACEHA0AgBSAHaiAFIAdq/QAAAP0MAAAAAAAAAAAAAAAAAAAAAP3pAf0LAAAgB0EQaiEHIAcgCUkNAAsL5QEDBH8BfQJ7IARBAnQhCSAFQQJ0IQpBACEHA0D9DAAAAAAAAAAAAAAAAAAAAAAhDP0MAAAAAAAAAAAAAAAAAAAAACENQQAhCANAIAwgAP0AAAAgAiAIav0AAAD95gH95AEhDCANIAD9AAAQIAIgCGr9AAAQ/eYB/eQBIQ0gAEEgaiEAIAhBIGohCCAIIAlJDQALIAwgDf3kASEMIAz9HwAgDP0fAZIgDP0fApIgDP0fA5IgASAHaioCAJIhCyAGBEAgC0MAAAAAlyELCyADIAdqIAs4AgAgB0EEaiEHIAcgCkkNAAsLgwQDBn8BfQV7IARBAnQhCSAFQQJ0IQpBACEHA0D9DAAAAAAAAAAAAAAAAAAAAAAhDv0MAAAAAAAAAAAAAAAAAAAAACEP/QwAAAAAAAAAAAAAAAAAAAAAIRD9DAAAAAAAAAAAAAAAAAAAAAAhEUEAIQgDQCAA/QAAACESIA4gEiACIAhq/QAAAP3mAf3kASEOIA8gEiACIAhqIAlq/QAAAP3mAf3kASEPIBAgEiACIAhqIAlqIAlq/QAAAP3mAf3kASEQIBEgEiACIAhqIAlqIAlqIAlq/QAAAP3mAf3kASERIABBEGohACAIQRBqIQggCCAJSQ0ACyAO/R8AIA79HwGSIA79HwKSIA79HwOSIAEgB2oqAgCSIQ0gBgRAIA1DAAAAAJchDQsgAyAHaiANOAIAIA/9HwAgD/0fAZIgD/0fApIgD/0fA5IgASAHaioCAJIhDSAGBEAgDUMAAAAAlyENCyADIAdqIApqIA04AgAgEP0fACAQ/R8BkiAQ/R8CkiAQ/R8DkiABIAdqKgIAkiENIAYEQCANQwAAAACXIQ0LIAMgB2ogCmogCmogDTgCACAR/R8AIBH9HwGSIBH9HwKSIBH9HwOSIAEgB2oqAgCSIQ0gBgRAIA1DAAAAAJchDQsgAyAHaiAKaiAKaiAKaiANOAIAIAdBBGohByAHIApJDQALCw==';
+  let wasm = null;
+  function setupWasm() {
+    try {
+      const bytes = Uint8Array.from(atob(WASM_NET), c => c.charCodeAt(0));
+      const L = net.L, last = L[L.length - 1].out;
+      if (typeof WebAssembly !== 'object' || !WebAssembly.validate(bytes)) return null;
+      if (L.some((l, i) => l.out % 4 || (i > 0 && l.in % 8)) || last % 8) return null;
+      let top = 0;
+      const al = n => { const o = top; top += Math.ceil(n / 4) * 16; return o; };
+      const off = {
+        L: L.map(l => ({ W: al(l.in * l.out), b: al(l.out), h: al(l.out), hb: al(4 * l.out) })),
+        pol: { W: al(9 * last), b: al(9) }, val: { W: al(last), b: al(1) }, x: al(L[0].in), lg: al(9), v: al(1),
+      };
+      const mem = new WebAssembly.Memory({ initial: Math.ceil(top / 65536) });
+      const ex = new WebAssembly.Instance(new WebAssembly.Module(bytes), { e: { m: mem } }).exports;
+      const F = new Float32Array(mem.buffer);
+      L.forEach((l, i) => { F.set(i ? l.W : l.WT, off.L[i].W / 4); F.set(l.b, off.L[i].b / 4); });
+      for (const k of ['pol', 'val']) { F.set(net[k].W, off[k].W / 4); F.set(net[k].b, off[k].b / 4); }
+      return { ex, off, F, view: (o, n) => new Float32Array(mem.buffer, o, n) };
+    } catch (e) { return null; }
   }
   function dense(l, x, y) {
     const n = l.in;
@@ -451,8 +476,8 @@ function engineLib() {
     const h = p * 9 + rel, n = dst[h];
     dst[h] = 0;
     let i = h;
-    if (n === 1) { i = (h + 1) % 18; dst[i]++; }
-    else { dst[h] = 1; for (let j = 1; j < n; j++) { i = (i + 1) % 18; dst[i]++; } }
+    if (n === 1) { i = h === 17 ? 0 : h + 1; dst[i]++; }
+    else { dst[h] = 1; for (let j = 1; j < n; j++) { if (++i === 18) i = 0; dst[i]++; } }
     if ((i / 9 | 0) === q && t[p] !== i) {
       const c = dst[i];
       if (c % 2 === 0) { k[p] += c; dst[i] = 0; }
@@ -529,7 +554,7 @@ function engineLib() {
               k3[0] = k2[0]; k3[1] = k2[1]; t3[0] = t2[0]; t3[1] = t2[1];
               sow(b2, b3, k3, t3, p, m2);
               const w = leaf(k3, isTerm(k3) || collect(b3, k3, q), p, m0);
-              if (w > val) val = w;
+              if (w > val) { val = w; if (val >= v) break; } // дальше min(v, val) уже не изменится
             }
           }
           if (val < v) v = val;
@@ -538,7 +563,7 @@ function engineLib() {
       x[base + m] = Math.max(-30, Math.min(30, v)) / 10;
     }
   }
-  function evalNet(s) {
+  function encode(s) {
     const x = bufs.x, p = s.turn, q = 1 - p;
     x.fill(0);
     for (let i = 0; i < 18; i++) {
@@ -552,31 +577,67 @@ function engineLib() {
     if (x.length > 617) addTactics(s, x);
     if (x.length > 851) addReplies(s, x, 851, p);
     if (x.length > 878) { addReplies(s, x, 878, q); addExchange(s, x, 905); }
-    const l0 = net.L[0], h0 = bufs.h[0], out = l0.out;
-    h0.set(l0.b);
-    for (let i = 0; i < x.length; i++) {
-      const xi = x[i];
-      if (xi === 0) continue;
-      const base = i * out;
-      for (let o = 0; o < out; o++) h0[o] += l0.WT[base + o] * xi;
+  }
+  function evalNet(s) {
+    encode(s);
+    const x = bufs.x, vv = new Float32Array(1);
+    if (wasm) {
+      const { ex, off } = wasm, L = net.L, n = L.length - 1;
+      ex.sparse(off.L[0].W, off.L[0].b, off.x, L[0].in, L[0].out, off.L[0].h);
+      for (let li = 1; li <= n; li++) ex.dense(off.L[li].W, off.L[li].b, off.L[li - 1].h, off.L[li].h, L[li].in, L[li].out, 1);
+      ex.dense(off.pol.W, off.pol.b, off.L[n].h, off.lg, L[n].out, 9, 0);
+      ex.dense(off.val.W, off.val.b, off.L[n].h, off.v, L[n].out, 1, 0);
+      vv[0] = wasm.F[off.v / 4];
+    } else {
+      const l0 = net.L[0], h0 = bufs.h[0], out = l0.out;
+      h0.set(l0.b);
+      for (let i = 0; i < x.length; i++) {
+        const xi = x[i];
+        if (xi === 0) continue;
+        const base = i * out;
+        for (let o = 0; o < out; o++) h0[o] += l0.WT[base + o] * xi;
+      }
+      for (let o = 0; o < out; o++) if (h0[o] < 0) h0[o] = 0;
+      for (let li = 1; li < net.L.length; li++) {
+        const h = bufs.h[li];
+        dense(net.L[li], bufs.h[li - 1], h);
+        for (let o = 0; o < h.length; o++) if (h[o] < 0) h[o] = 0;
+      }
+      const last = bufs.h[net.L.length - 1];
+      dense(net.pol, last, bufs.lg);
+      dense(net.val, last, vv);
     }
-    for (let o = 0; o < out; o++) if (h0[o] < 0) h0[o] = 0;
-    for (let li = 1; li < net.L.length; li++) {
-      const h = bufs.h[li];
-      dense(net.L[li], bufs.h[li - 1], h);
-      for (let o = 0; o < h.length; o++) if (h[o] < 0) h[o] = 0;
-    }
-    const last = bufs.h[net.L.length - 1];
-    dense(net.pol, last, bufs.lg);
-    const vv = new Float32Array(1);
-    dense(net.val, last, vv);
-    const P = new Float32Array(9);
+    return policy(s, bufs.lg, vv[0]);
+  }
+  function policy(s, lg, v) {
+    const P = new Float32Array(9), p = s.turn;
     let mx = -Infinity;
-    for (let a = 0; a < 9; a++) if (s.b[p * 9 + a] > 0 && bufs.lg[a] > mx) mx = bufs.lg[a];
+    for (let a = 0; a < 9; a++) if (s.b[p * 9 + a] > 0 && lg[a] > mx) mx = lg[a];
     let sum = 0;
-    for (let a = 0; a < 9; a++) if (s.b[p * 9 + a] > 0) { P[a] = Math.exp(bufs.lg[a] - mx); sum += P[a]; }
+    for (let a = 0; a < 9; a++) if (s.b[p * 9 + a] > 0) { P[a] = Math.exp(lg[a] - mx); sum += P[a]; }
     for (let a = 0; a < 9; a++) P[a] /= sum;
-    return { P, v: Math.tanh(vv[0]) };
+    return { P, v: Math.tanh(v) };
+  }
+  // Несколько позиций сразу (воркеры поиска): слои после первого считаются по 4 позиции за один проход по весам
+  function evalBatch(states) {
+    if (!wasm) return states.map(evalNet);
+    const { ex, off, F } = wasm, L = net.L, n = L.length - 1, res = [];
+    let g = 0;
+    for (; g + 4 <= states.length; g += 4) {
+      for (let k = 0; k < 4; k++) {
+        encode(states[g + k]);
+        ex.sparse(off.L[0].W, off.L[0].b, off.x, L[0].in, L[0].out, off.L[0].hb + k * L[0].out * 4);
+      }
+      for (let li = 1; li <= n; li++) ex.dense4(off.L[li].W, off.L[li].b, off.L[li - 1].hb, off.L[li].hb, L[li].in, L[li].out, 1);
+      for (let k = 0; k < 4; k++) {
+        const h = off.L[n].hb + k * L[n].out * 4;
+        ex.dense(off.pol.W, off.pol.b, h, off.lg, L[n].out, 9, 0);
+        ex.dense(off.val.W, off.val.b, h, off.v, L[n].out, 1, 0);
+        res.push(policy(states[g + k], bufs.lg, F[off.v / 4]));
+      }
+    }
+    for (; g < states.length; g++) res.push(evalNet(states[g]));
+    return res;
   }
 
   // ---- MCTS (как в togyz/mcts.py) ----
@@ -799,7 +860,7 @@ function engineLib() {
     });
     return { res, whiteWin: ev.map((e, k) => states[k].turn === 0 ? (1 + e.v) / 2 : (1 - e.v) / 2) };
   }
-  return { initial, play, loadNet, evalNet, think, thinkAsync, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
+  return { initial, play, loadNet, evalNet, evalBatch, think, thinkAsync, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
 }
 
 
@@ -818,9 +879,9 @@ const LEVELS = [
   { name: 'Новичок', sims: 0, temp: true, info: 'интуиция сети, ошибается' },
   { name: 'Любитель', sims: 60, info: '60 вариантов, мгновенно' },
   { name: 'Сильный', sims: 400, info: '400 вариантов на ход' },
-  { name: 'Мастер', sims: 3000, info: '3 000 вариантов, ~1 с' },
-  { name: 'Максимум', sims: 200000, ms: 5000, info: 'до 5 секунд на ход' },
-  { name: 'Предел', sims: 400000, ms: 15000, info: 'до 15 секунд на ход' },
+  { name: 'Мастер', sims: 3000, info: '3 000 вариантов на ход' },
+  { name: 'Максимум', sims: 400000, ms: 5000, info: 'до 5 секунд на ход' },
+  { name: 'Предел', sims: 600000, ms: 15000, info: 'до 15 секунд на ход' },
 ];
 const AN_SIMS = 300;
 const K_SAVES = 'togyz-app-saves-v1', K_PZ = 'togyz-pz-v1', K_PREF = 'togyz-app-pref-v1';
@@ -842,7 +903,7 @@ if (NET) {
       onmessage = e => {
         const d = e.data;
         if (d.net) { W.loadNet(d.net); return; }
-        if (d.batch) { postMessage({ id: d.id, r: d.batch.map(s => { const e = W.evalNet(s); return { P: Array.from(e.P), v: e.v }; }) }); return; }
+        if (d.batch) { postMessage({ id: d.id, r: W.evalBatch(d.batch).map(e => ({ P: Array.from(e.P), v: e.v })) }); return; }
         if (d.evalMoves) { postMessage({ id: d.id, r: W.evalMoves(d.evalMoves, d.sims) }); return; }
         if (d.evalLive) {
           const r = W.evalMovesLive(d.evalLive, d.steps, (l, k, n) => postMessage({ id: d.id, progress: [l, k, n] }));
