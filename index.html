@@ -970,7 +970,7 @@ function think(state, opts) {
   if (!P) return ask({ state, opts }, () => E.think(state, opts));
   stopThinking();
   const id = reqId;
-  return E.thinkAsync(state, Object.assign({ cancel: () => id !== reqId }, opts), P, opts.sims < 5000 ? 4 : 8)
+  return E.thinkAsync(state, Object.assign({ cancel: () => id !== reqId }, opts), P, opts.sims < 5000 ? 4 : 16)
     .then(r => new Promise(res => { if (id === reqId) res(r); }));
 }
 const evalMovesInWorker = (state, sims) => ask({ evalMoves: state, sims }, () => E.evalMoves(state, sims));
