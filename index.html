@@ -409,10 +409,63 @@ function engineLib() {
     net = { L, pol: { in: j.pol.in, out: 9, W: f32(j.pol.w), b: f32(j.pol.b) }, val: { in: j.val.in, out: 1, W: f32(j.val.w), b: f32(j.val.b) } };
     bufs = { x: new Float32Array(Math.max(617, L[0].in)), scratch: new Int32Array(18), h: L.map(l => new Float32Array(l.out)), lg: new Float32Array(9) };
     wasm = setupWasm();
-    if (wasm) { bufs.x = wasm.view(wasm.off.x, L[0].in); bufs.lg = wasm.view(wasm.off.lg, 9); }
+    if (wasm) { bufs.x = wasm.view(wasm.off.x, L[0].in); bufs.lg = wasm.view(wasm.off.lg, 9); setupQuant(); }
   }
-  // Слои сети на WebAssembly SIMD (модуль собран f4/build_wasm.py): в ~5 раз быстрее JS; без поддержки — JS-вариант в evalNet
-  const WASM_NET = 'AGFzbQEAAAABFAJgBn9/f39/fwBgB39/f39/f38AAggBAWUBbQIAAQMEAwABAQcbAwZzcGFyc2UAAAVkZW5zZQABBmRlbnNlNAACCtkHA+oBAwV/AX0BeyAEQQJ0IQkgA0ECdCEKQQAhBwNAIAUgB2ogASAHav0AAAD9CwAAIAdBEGohByAHIAlJDQALQQAhBiAAIQgDQCACIAZqKgIAIgtDAAAAAFwEQCAL/RMhDEEAIQcDQCAFIAdqIAUgB2r9AAAAIAggB2r9AAAAIAz95gH95AH9CwAAIAdBEGohByAHIAlJDQALCyAIIAlqIQggBkEEaiEGIAYgCkkNAAtBACEHA0AgBSAHaiAFIAdq/QAAAP0MAAAAAAAAAAAAAAAAAAAAAP3pAf0LAAAgB0EQaiEHIAcgCUkNAAsL5QEDBH8BfQJ7IARBAnQhCSAFQQJ0IQpBACEHA0D9DAAAAAAAAAAAAAAAAAAAAAAhDP0MAAAAAAAAAAAAAAAAAAAAACENQQAhCANAIAwgAP0AAAAgAiAIav0AAAD95gH95AEhDCANIAD9AAAQIAIgCGr9AAAQ/eYB/eQBIQ0gAEEgaiEAIAhBIGohCCAIIAlJDQALIAwgDf3kASEMIAz9HwAgDP0fAZIgDP0fApIgDP0fA5IgASAHaioCAJIhCyAGBEAgC0MAAAAAlyELCyADIAdqIAs4AgAgB0EEaiEHIAcgCkkNAAsLgwQDBn8BfQV7IARBAnQhCSAFQQJ0IQpBACEHA0D9DAAAAAAAAAAAAAAAAAAAAAAhDv0MAAAAAAAAAAAAAAAAAAAAACEP/QwAAAAAAAAAAAAAAAAAAAAAIRD9DAAAAAAAAAAAAAAAAAAAAAAhEUEAIQgDQCAA/QAAACESIA4gEiACIAhq/QAAAP3mAf3kASEOIA8gEiACIAhqIAlq/QAAAP3mAf3kASEPIBAgEiACIAhqIAlqIAlq/QAAAP3mAf3kASEQIBEgEiACIAhqIAlqIAlqIAlq/QAAAP3mAf3kASERIABBEGohACAIQRBqIQggCCAJSQ0ACyAO/R8AIA79HwGSIA79HwKSIA79HwOSIAEgB2oqAgCSIQ0gBgRAIA1DAAAAAJchDQsgAyAHaiANOAIAIA/9HwAgD/0fAZIgD/0fApIgD/0fA5IgASAHaioCAJIhDSAGBEAgDUMAAAAAlyENCyADIAdqIApqIA04AgAgEP0fACAQ/R8BkiAQ/R8CkiAQ/R8DkiABIAdqKgIAkiENIAYEQCANQwAAAACXIQ0LIAMgB2ogCmogCmogDTgCACAR/R8AIBH9HwGSIBH9HwKSIBH9HwOSIAEgB2oqAgCSIQ0gBgRAIA1DAAAAAJchDQsgAyAHaiAKaiAKaiAKaiANOAIAIAdBBGohByAHIApJDQALCw==';
+  // int16 для слоёв после первого: вход слоя x·sc (sc — по наибольшему значению на случайных позициях, с запасом),
+  // веса строки ·sw (так, чтобы сумма в int32 не переполнилась ни при каком входе), результат ·inv = 1/(sw·sc)
+  const Q16 = true;
+  function setupQuant() {
+    const { ex, off, F } = wasm, L = net.L, n = L.length - 1;
+    wasm.q = false;
+    if (!Q16 || !ex.dense16 || L.some((l, i) => i > 0 && l.in % 8)) return;
+    const mx = new Float64Array(n);
+    let s = initial(), seed = 12345;
+    for (let it = 0; it < 3000; it++) {
+      const legal = [];
+      for (let a = 0; a < 9; a++) if (s.b[s.turn * 9 + a] > 0) legal.push(a);
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      s = play(s, legal[(seed >>> 8) % legal.length], false).s;
+      if (s.over) { s = initial(); continue; }
+      encode(s);
+      first(off.L[0].h);
+      for (let li = 1; li < n; li++) ex.dense(off.L[li].W, off.L[li].b, off.L[li - 1].h, off.L[li].h, L[li].in, L[li].out, 1);
+      for (let li = 0; li < n; li++) { const o = off.L[li].h / 4; for (let j = 0; j < L[li].out; j++) if (F[o + j] > mx[li]) mx[li] = F[o + j]; }
+    }
+    for (let li = 1; li <= n; li++) {
+      const l = L[li], sc = 2047 / Math.max(1e-3, mx[li - 1] * 1.25), o = off.L[li];
+      const W16 = new Int16Array(F.buffer, o.W16, l.in * l.out);
+      F[o.sc / 4] = sc;
+      for (let r = 0; r < l.out; r++) {
+        let amax = 0, asum = 0;
+        for (let i = 0; i < l.in; i++) { const a = Math.abs(l.W[r * l.in + i]); asum += a; if (a > amax) amax = a; }
+        const sw = amax > 0 ? Math.min(32767 / amax, 2147483647 / (2047 * asum)) : 1;
+        for (let i = 0; i < l.in; i++) W16[r * l.in + i] = Math.round(l.W[r * l.in + i] * sw);
+        F[o.inv / 4 + r] = 1 / (sw * sc);
+      }
+    }
+    wasm.q = true;
+    wasm.cal = Array.from(mx);
+  }
+  // первый слой (вход разреженный) в dst
+  function first(dst) {
+    const { ex, off } = wasm, l = net.L[0];
+    if (l.out % 16 === 0) ex.sparse16(off.L[0].W, off.L[0].b, off.x, l.in, l.out, dst, off.tmp);
+    else ex.sparse(off.L[0].W, off.L[0].b, off.x, l.in, l.out, dst);
+  }
+  // скрытые слои после первого: из h[0] (или 4 векторов hb[0]) в h[n] (hb[n])
+  function hidden(batch) {
+    const { ex, off } = wasm, L = net.L, n = L.length - 1, h = batch ? 'hb' : 'h', K = batch ? 4 : 1;
+    for (let li = 1; li <= n; li++) {
+      const o = off.L[li], l = L[li];
+      if (wasm.q) {
+        ex.quant(off.L[li - 1][h], o.hq, K * l.in, o.sc);
+        (batch ? ex.dense16x4 : ex.dense16)(o.W16, o.b, o.inv, o.hq, o[h], l.in, l.out);
+      } else (batch ? ex.dense4 : ex.dense)(o.W, o.b, off.L[li - 1][h], o[h], l.in, l.out, 1);
+    }
+  }
+  // Слои сети на WebAssembly SIMD (модуль собран f4/build_wasm.py): в ~5 раз быстрее JS; без поддержки — JS-вариант в evalNet.
+  // Слои после первого — в int16 (dot_i16x8: 8 умножений за команду), масштабы подбираются при загрузке (setupQuant)
+  const WASM_NET = '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';
   let wasm = null;
   function setupWasm() {
     try {
@@ -423,8 +476,8 @@ function engineLib() {
       let top = 0;
       const al = n => { const o = top; top += Math.ceil(n / 4) * 16; return o; };
       const off = {
-        L: L.map(l => ({ W: al(l.in * l.out), b: al(l.out), h: al(l.out), hb: al(4 * l.out) })),
-        pol: { W: al(9 * last), b: al(9) }, val: { W: al(last), b: al(1) }, x: al(L[0].in), lg: al(9), v: al(1),
+        L: L.map(l => ({ W: al(l.in * l.out), b: al(l.out), h: al(l.out), hb: al(4 * l.out), W16: al(l.in * l.out / 2), inv: al(l.out), hq: al(2 * l.in), sc: al(1) })),
+        pol: { W: al(9 * last), b: al(9) }, val: { W: al(last), b: al(1) }, x: al(L[0].in), tmp: al(2 * L[0].in), lg: al(9), v: al(1),
       };
       const mem = new WebAssembly.Memory({ initial: Math.ceil(top / 65536) });
       const ex = new WebAssembly.Instance(new WebAssembly.Module(bytes), { e: { m: mem } }).exports;
@@ -445,26 +498,22 @@ function engineLib() {
   }
   // «тактические» признаки (как _tactics в togyz/game.py): что берёт каждый ход, туздык, куда ложится последний камень
   function addTactics(s, x) {
-    const sc = bufs.scratch, p = s.turn;
+    const p = s.turn;
     for (let role = 0; role < 2; role++) {
       const side = role === 0 ? p : 1 - p, other = 1 - side;
       for (let m = 0; m < 9; m++) {
         const h = side * 9 + m, n = s.b[h];
         if (n === 0) continue;
         const o = 617 + role * 117 + m * 13;
-        for (let i = 0; i < 18; i++) sc[i] = s.b[i];
-        sc[h] = 0;
-        let land;
-        if (n === 1) { land = (h + 1) % 18; sc[land]++; }
-        else { sc[h] = 1; land = h; for (let j = 0; j < n - 1; j++) { land = (land + 1) % 18; sc[land]++; } }
+        const start = n === 1 ? (h === 17 ? 0 : h + 1) : h, laps = DIV18[n], land = MOD18[start + n - 1];
         let cap = 0, tuz = 0;
-        const landsOpp = (land / 9 | 0) === other ? 1 : 0;
+        const landsOpp = (land >= 9 ? 1 : 0) === other ? 1 : 0;
         if (landsOpp && s.t[side] !== land) {
-          const c = sc[land];
+          const c = (land === h ? 0 : s.b[land]) + laps + (dist(land, start) < n - laps * 18 ? 1 : 0);
           if (c % 2 === 0) cap = c;
           else if (c === 3 && s.t[side] < 0 && land % 9 !== 8) { const ot = s.t[other]; if (!(ot >= 0 && ot % 9 === land % 9)) { cap = 3; tuz = 1; } }
         }
-        x[o] = 1; x[o + 1] = Math.min(cap, 30) / 10; x[o + 2] = tuz; x[o + 3] = landsOpp; x[o + 4 + land % 9] = 1;
+        x[o] = 1; x[o + 1] = Math.min(cap, 30) / 10; x[o + 2] = tuz; x[o + 3] = landsOpp; x[o + 4 + (land >= 9 ? land - 9 : land)] = 1;
       }
     }
   }
@@ -478,13 +527,52 @@ function engineLib() {
     let i = h;
     if (n === 1) { i = h === 17 ? 0 : h + 1; dst[i]++; }
     else { dst[h] = 1; for (let j = 1; j < n; j++) { if (++i === 18) i = 0; dst[i]++; } }
-    if ((i / 9 | 0) === q && t[p] !== i) {
+    if ((i >= 9 ? 1 : 0) === q && t[p] !== i) {
       const c = dst[i];
-      if (c % 2 === 0) { k[p] += c; dst[i] = 0; }
-      else if (c === 3 && t[p] < 0 && i % 9 !== 8 && !(t[q] >= 0 && t[q] % 9 === i % 9)) { t[p] = i; k[p] += 3; dst[i] = 0; }
+      if ((c & 1) === 0) { k[p] += c; dst[i] = 0; }
+      else if (c === 3 && t[p] < 0) {
+        const im = i >= 9 ? i - 9 : i, tq = t[q];
+        if (im !== 8 && !(tq >= 0 && (tq >= 9 ? tq - 9 : tq) === im)) { t[p] = i; k[p] += 3; dst[i] = 0; }
+      }
     }
     for (let r = 0; r < 2; r++) if (t[r] >= 0 && dst[t[r]] > 0) { k[r] += dst[t[r]]; dst[t[r]] = 0; }
   }
+  // Итог хода без копирования доски (для последнего полухода в переборах): камни раскладываются кругами,
+  // лунка j получает laps + (смещение от start < rem). На входе sumP — камни на стороне ходящего, sumAll — на всей доске.
+  // На выходе qk (счёт после хода, до добора камней), qs (камни на сторонах), qtuz (поставлен туздык).
+  const qk = new Int32Array(2), qs = new Int32Array(2);
+  let qtuz = 0;
+  // деление и остаток — через таблицы и сравнения (целочисленное деление в JS медленное)
+  const DIV18 = new Int32Array(200), MOD18 = new Int32Array(200);
+  for (let i = 0; i < 200; i++) { DIV18[i] = (i / 18) | 0; MOD18[i] = i % 18; }
+  const dist = (j, start) => { const d = j - start; return d < 0 ? d + 18 : d; };
+  function quick(b, k, t, p, rel, sumP, sumAll) {
+    const q = 1 - p, h = p * 9 + rel, n = b[h];
+    const start = n === 1 ? (h === 17 ? 0 : h + 1) : h, laps = DIV18[n], rem = n - laps * 18;
+    const land = MOD18[start + n - 1];
+    let kp = k[p], kq = k[q], cap = 0;
+    const tp = t[p], tq = t[q];
+    qtuz = 0;
+    if ((land >= 9 ? 1 : 0) === q && tp !== land) {
+      const c = (land === h ? 0 : b[land]) + laps + (dist(land, start) < rem ? 1 : 0);
+      if ((c & 1) === 0) cap = c;
+      else if (c === 3 && tp < 0) {
+        const lm = land >= 9 ? land - 9 : land;
+        if (lm !== 8 && !(tq >= 0 && (tq >= 9 ? tq - 9 : tq) === lm)) { cap = 3; qtuz = 1; }
+      }
+    }
+    kp += cap;
+    // туздыки (на них ходить нельзя, там всегда пусто): забирают всё, что в них упало
+    const gp = tp >= 0 ? b[tp] + laps + (dist(tp, start) < rem ? 1 : 0) : 0;
+    const gq = tq >= 0 ? b[tq] + laps + (dist(tq, start) < rem ? 1 : 0) : 0;
+    kp += gp; kq += gq;
+    // камни, упавшие на сторону ходящего: laps*9 + пересечение [start, start+rem) с её лунками (с учётом круга)
+    const lo = p * 9, e = start + rem;
+    let rp = laps * 9 + Math.max(0, Math.min(e, lo + 9) - Math.max(start, lo)) + Math.max(0, Math.min(e, lo + 27) - Math.max(start, lo + 18));
+    const sp = sumP - n + rp - gq;
+    qk[p] = kp; qk[q] = kq; qs[p] = sp; qs[q] = sumAll - cap - gp - gq - sp;
+  }
+  const qTerm = () => qk[0] > 81 || qk[1] > 81 || (qk[0] === 81 && qk[1] === 81);
   function addReplies(s, x, base, p) {
     const q = 1 - p;
     for (let m = 0; m < 9; m++) {
@@ -495,20 +583,16 @@ function engineLib() {
       let left = 0;
       for (let i = q * 9; i < q * 9 + 9; i++) left += cb[i];
       if (left === 0) continue;
-      let best = 0, tuz = 0, hurt = 0;
+      let best = 0, tuz = 0, hurt = 0, all = left;
+      for (let i = p * 9; i < p * 9 + 9; i++) all += cb[i];
       for (let r = 0; r < 9; r++) {
         if (cb[q * 9 + r] === 0) continue;
-        kk2[0] = kk[0]; kk2[1] = kk[1]; tt2[0] = tt[0]; tt2[1] = tt[1];
-        sow(cb, rb, kk2, tt2, q, r);
-        let g = kk2[q] - kk[q];
-        if (!(kk2[0] > 81 || kk2[1] > 81 || (kk2[0] === 81 && kk2[1] === 81))) {
-          let mine = 0;
-          for (let i = p * 9; i < p * 9 + 9; i++) mine += rb[i];
-          if (mine === 0) for (let i = q * 9; i < q * 9 + 9; i++) g += rb[i]; // ходить нечем: забираем свои камни
-        }
+        quick(cb, kk, tt, q, r, left, all);
+        let g = qk[q] - kk[q];
+        if (!qTerm() && qs[p] === 0) g += qs[q]; // ходить нечем: забираем свои камни
         if (g > best) best = g;
         if (g > 0) hurt++;
-        if (tt2[q] !== tt[q]) tuz = 1;
+        if (qtuz) tuz = 1;
       }
       const o = base + m * 3;
       x[o] = Math.min(best, 30) / 10; x[o + 1] = tuz; x[o + 2] = hurt / 9;
@@ -531,8 +615,9 @@ function engineLib() {
     if (term) { if (k[p] > k[1 - p]) d += 30; else if (k[p] < k[1 - p]) d -= 30; }
     return d;
   }
-  function addExchange(s, x, base) {
-    const p = s.turn, q = 1 - p, m0 = s.k[p] - s.k[q];
+  const ord = new Int32Array(9), ordG = new Int32Array(9);
+  function addExchange(s, x, base, p) {
+    const q = 1 - p, m0 = s.k[p] - s.k[q];
     for (let m = 0; m < 9; m++) {
       if (s.b[p * 9 + m] === 0) continue;
       k1[0] = s.k[0]; k1[1] = s.k[1]; t1[0] = s.t[0]; t1[1] = s.t[1];
@@ -541,19 +626,36 @@ function engineLib() {
       if (isTerm(k1) || collect(b1, k1, q)) v = leaf(k1, true, p, m0);
       else {
         v = 1000;
+        // ответы соперника — по убыванию того, что они сразу берут: лучший ответ раньше даёт малое v,
+        // и перебор наших третьих ходов чаще обрывается (результат тот же)
+        let s1q = 0, s1p = 0, nr = 0;
+        for (let i = q * 9; i < q * 9 + 9; i++) s1q += b1[i];
+        for (let i = p * 9; i < p * 9 + 9; i++) s1p += b1[i];
         for (let r = 0; r < 9; r++) {
           if (b1[q * 9 + r] === 0) continue;
+          quick(b1, k1, t1, q, r, s1q, s1q + s1p);
+          const g = qk[q] - qk[p];
+          let j = nr++;
+          for (; j > 0 && ordG[j - 1] < g; j--) { ordG[j] = ordG[j - 1]; ord[j] = ord[j - 1]; }
+          ordG[j] = g; ord[j] = r;
+        }
+        for (let ri = 0; ri < nr; ri++) {
+          const r = ord[ri];
           k2[0] = k1[0]; k2[1] = k1[1]; t2[0] = t1[0]; t2[1] = t1[1];
           sow(b1, b2, k2, t2, q, r);
           let val;
           if (isTerm(k2) || collect(b2, k2, p)) val = leaf(k2, true, p, m0);
           else {
             val = -1000;
+            let sp = 0, sq = 0;
+            for (let i = p * 9; i < p * 9 + 9; i++) sp += b2[i];
+            for (let i = q * 9; i < q * 9 + 9; i++) sq += b2[i];
             for (let m2 = 0; m2 < 9; m2++) {
               if (b2[p * 9 + m2] === 0) continue;
-              k3[0] = k2[0]; k3[1] = k2[1]; t3[0] = t2[0]; t3[1] = t2[1];
-              sow(b2, b3, k3, t3, p, m2);
-              const w = leaf(k3, isTerm(k3) || collect(b3, k3, q), p, m0);
+              quick(b2, k2, t2, p, m2, sp, sp + sq);
+              let term = qTerm();
+              if (!term && qs[q] === 0) { qk[p] += qs[p]; term = true; } // сопернику нечем ходить: свои камни нам
+              const w = leaf(qk, term, p, m0);
               if (w > val) { val = w; if (val >= v) break; } // дальше min(v, val) уже не изменится
             }
           }
@@ -563,11 +665,39 @@ function engineLib() {
       x[base + m] = Math.max(-30, Math.min(30, v)) / 10;
     }
   }
+  // f5: карта взятий по целевым лункам (из признаков addTactics), как _targets в f5/togyz/game.py
+  function addTargets(x, base) {
+    for (let role = 0; role < 2; role++) for (let m = 0; m < 9; m++) {
+      const o = 617 + role * 117 + m * 13;
+      if (x[o] === 0 || x[o + 3] === 0 || x[o + 1] === 0) continue;
+      for (let j = 0; j < 9; j++) if (x[o + 4 + j] !== 0) { const d = base + role * 9 + j; if (x[o + 1] > x[d]) x[d] = x[o + 1]; break; }
+    }
+  }
+  // f5: угрозы на следующий ход после каждого своего хода, если соперник «пропустит» (как _threats)
+  function addThreats(s, x, base) {
+    const p = s.turn;
+    for (let m = 0; m < 9; m++) {
+      if (s.b[p * 9 + m] === 0) continue;
+      k1[0] = s.k[0]; k1[1] = s.k[1]; t1[0] = s.t[0]; t1[1] = s.t[1];
+      sow(s.b, b1, k1, t1, p, m);
+      if (isTerm(k1)) continue;
+      let best = 0, cnt = 0;
+      for (let m2 = 0; m2 < 9; m2++) {
+        if (b1[p * 9 + m2] === 0) continue;
+        k2[0] = k1[0]; k2[1] = k1[1]; t2[0] = t1[0]; t2[1] = t1[1];
+        sow(b1, b2, k2, t2, p, m2);
+        const g = k2[p] - k1[p];
+        if (g > best) best = g;
+        if (g > 0) cnt++;
+      }
+      x[base + m] = Math.min(best, 30) / 10; x[base + 9 + m] = cnt / 9;
+    }
+  }
   function encode(s) {
     const x = bufs.x, p = s.turn, q = 1 - p;
     x.fill(0);
     for (let i = 0; i < 18; i++) {
-      const n = s.b[(p * 9 + i) % 18];
+      const n = s.b[MOD18[p * 9 + i]];
       x[i * 32 + Math.min(n, 31)] = 1;
       x[576 + i] = n / 32;
     }
@@ -576,15 +706,16 @@ function engineLib() {
     x[607 + (s.t[q] < 0 ? 0 : 1 + s.t[q] % 9)] = 1;
     if (x.length > 617) addTactics(s, x);
     if (x.length > 851) addReplies(s, x, 851, p);
-    if (x.length > 878) { addReplies(s, x, 878, q); addExchange(s, x, 905); }
+    if (x.length > 878) { addReplies(s, x, 878, q); addExchange(s, x, 905, p); }
+    if (x.length > 914) { addExchange(s, x, 914, q); addTargets(x, 923); addThreats(s, x, 941); }
   }
   function evalNet(s) {
     encode(s);
     const x = bufs.x, vv = new Float32Array(1);
     if (wasm) {
       const { ex, off } = wasm, L = net.L, n = L.length - 1;
-      ex.sparse(off.L[0].W, off.L[0].b, off.x, L[0].in, L[0].out, off.L[0].h);
-      for (let li = 1; li <= n; li++) ex.dense(off.L[li].W, off.L[li].b, off.L[li - 1].h, off.L[li].h, L[li].in, L[li].out, 1);
+      first(off.L[0].h);
+      hidden(false);
       ex.dense(off.pol.W, off.pol.b, off.L[n].h, off.lg, L[n].out, 9, 0);
       ex.dense(off.val.W, off.val.b, off.L[n].h, off.v, L[n].out, 1, 0);
       vv[0] = wasm.F[off.v / 4];
@@ -626,9 +757,9 @@ function engineLib() {
     for (; g + 4 <= states.length; g += 4) {
       for (let k = 0; k < 4; k++) {
         encode(states[g + k]);
-        ex.sparse(off.L[0].W, off.L[0].b, off.x, L[0].in, L[0].out, off.L[0].hb + k * L[0].out * 4);
+        first(off.L[0].hb + k * L[0].out * 4);
       }
-      for (let li = 1; li <= n; li++) ex.dense4(off.L[li].W, off.L[li].b, off.L[li - 1].hb, off.L[li].hb, L[li].in, L[li].out, 1);
+      hidden(true);
       for (let k = 0; k < 4; k++) {
         const h = off.L[n].hb + k * L[n].out * 4;
         ex.dense(off.pol.W, off.pol.b, h, off.lg, L[n].out, 9, 0);
@@ -638,6 +769,33 @@ function engineLib() {
     }
     for (; g < states.length; g++) res.push(evalNet(states[g]));
     return res;
+  }
+
+  // Пачка позиций для воркера — один Int32Array (по 23 числа на позицию), ответ — один Float32Array (по 10: P и v):
+  // такие массивы передаются между потоками без поэлементного копирования
+  function pack(states) {
+    const a = new Int32Array(states.length * 23);
+    states.forEach((s, j) => {
+      const o = j * 23;
+      for (let i = 0; i < 18; i++) a[o + i] = s.b[i];
+      a[o + 18] = s.k[0]; a[o + 19] = s.k[1]; a[o + 20] = s.t[0]; a[o + 21] = s.t[1]; a[o + 22] = s.turn;
+    });
+    return a;
+  }
+  function evalPacked(a) {
+    const n = a.length / 23, states = [];
+    for (let j = 0; j < n; j++) {
+      const o = j * 23;
+      states.push({ b: a.subarray(o, o + 18), k: a.subarray(o + 18, o + 20), t: a.subarray(o + 20, o + 22), turn: a[o + 22], over: false });
+    }
+    const out = new Float32Array(n * 10);
+    evalBatch(states).forEach((e, j) => { out.set(e.P, j * 10); out[j * 10 + 9] = e.v; });
+    return out;
+  }
+  function unpack(out) {
+    const r = [];
+    for (let j = 0; j < out.length / 10; j++) r.push({ P: out.subarray(j * 10, j * 10 + 9), v: out[j * 10 + 9] });
+    return r;
   }
 
   // ---- MCTS (как в togyz/mcts.py) ----
@@ -860,7 +1018,7 @@ function engineLib() {
     });
     return { res, whiteWin: ev.map((e, k) => states[k].turn === 0 ? (1 + e.v) / 2 : (1 - e.v) / 2) };
   }
-  return { initial, play, loadNet, evalNet, evalBatch, think, thinkAsync, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
+  return { initial, play, loadNet, wasmInfo: () => wasm && { q: wasm.q, cal: wasm.cal }, evalNet, evalBatch, pack, evalPacked, unpack, think, thinkAsync, evalMoves, evalMovesLive, analyzeGame, finish, sideStones };
 }
 
 
@@ -903,7 +1061,7 @@ if (NET) {
       onmessage = e => {
         const d = e.data;
         if (d.net) { W.loadNet(d.net); return; }
-        if (d.batch) { postMessage({ id: d.id, r: W.evalBatch(d.batch).map(e => ({ P: Array.from(e.P), v: e.v })) }); return; }
+        if (d.packed) { const r = W.evalPacked(d.packed); postMessage({ id: d.id, r }, [r.buffer]); return; }
         if (d.evalMoves) { postMessage({ id: d.id, r: W.evalMoves(d.evalMoves, d.sims) }); return; }
         if (d.evalLive) {
           const r = W.evalMovesLive(d.evalLive, d.steps, (l, k, n) => postMessage({ id: d.id, progress: [l, k, n] }));
@@ -957,10 +1115,14 @@ function getPool() {
       const w = new Worker(workerURL), waits = new Map();
       let n = 0;
       w.postMessage({ net: NET });
-      w.onmessage = e => { const f = waits.get(e.data.id); if (f) { waits.delete(e.data.id); f[0](e.data.r); } };
+      w.onmessage = e => { const f = waits.get(e.data.id); if (f) { waits.delete(e.data.id); f[0](E.unpack(e.data.r)); } };
       // воркер упал — досчитываем его пачки здесь, чтобы поиск не завис
       w.onerror = () => { for (const [res, st] of waits.values()) res(st.map(s => E.evalNet(s))); waits.clear(); };
-      pool.push(states => new Promise(res => { const id = ++n; waits.set(id, [res, states]); w.postMessage({ id, batch: states }); }));
+      pool.push(states => new Promise(res => {
+        const id = ++n, a = E.pack(states);
+        waits.set(id, [res, states]);
+        w.postMessage({ id, packed: a }, [a.buffer]);
+      }));
     }
   } catch (e) { pool = null; }
   return pool;
